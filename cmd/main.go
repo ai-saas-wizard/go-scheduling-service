@@ -100,50 +100,11 @@ func HandleRequest(ctx context.Context, event json.RawMessage) (LambdaResponse, 
 		bodyToParse = []byte(genericEvent.Body)
 	}
 
-	// Try to detect VAPI tool-calls payload
-	var vapiPayload models.VAPIWebhookPayload
-	if err := json.Unmarshal(bodyToParse, &vapiPayload); err == nil && vapiPayload.Message.Type == "tool-calls" {
-		slog.InfoContext(ctx, "event_type_detected", "request_id", requestID, "type", "vapi_tool_calls")
+	// Try to detect VAPI tool-calls payload from bodyToParse
+	vapiParsed := tryParseVAPI(ctx, requestID, bodyToParse, openaiKey, &req, &extractedPropertyID)
 
-		// Extract Query from toolCalls
-		if len(vapiPayload.Message.ToolCalls) > 0 {
-			req.Query = vapiPayload.Message.ToolCalls[0].Function.Arguments.Query
-			req.Phone = vapiPayload.Message.ToolCalls[0].Function.Arguments.Phone
-			slog.InfoContext(ctx, "vapi_params_extracted", "request_id", requestID, "query", req.Query, "phone", req.Phone)
-		}
-
-		// Collect address candidates from tool_call_result messages
-		var candidates []clients.AddressCandidate
-		for _, msg := range vapiPayload.Message.Artifact.Messages {
-			if msg.Role == "tool_call_result" {
-				parsed := msg.ParseResult()
-				if parsed == nil {
-					continue
-				}
-				for i, result := range parsed.Results {
-					if result.Metadata.Address1 != "" && result.Metadata.PropertyId != "" {
-						candidates = append(candidates, clients.AddressCandidate{
-							Index:      i,
-							Address1:   result.Metadata.Address1,
-							PropertyId: result.Metadata.PropertyId,
-						})
-					}
-				}
-			}
-		}
-
-		// Use OpenAI to match query to address if candidates exist
-		if len(candidates) > 0 && openaiKey != "" && req.Query != "" {
-			slog.InfoContext(ctx, "openai_matching_started", "request_id", requestID, "candidate_count", len(candidates))
-			openaiClient := clients.NewOpenAIClient(openaiKey)
-			matchedID, err := openaiClient.MatchAddressToQuery(ctx, req.Query, candidates)
-			if err != nil {
-				slog.WarnContext(ctx, "openai_matching_failed", "request_id", requestID, "error", err)
-			} else {
-				extractedPropertyID = matchedID
-				slog.InfoContext(ctx, "openai_matching_succeeded", "request_id", requestID, "property_id", extractedPropertyID)
-			}
-		}
+	if vapiParsed {
+		// VAPI payload handled
 	} else if genericEvent.Body != "" {
 		slog.InfoContext(ctx, "event_type_detected", "request_id", requestID, "type", "api_gateway")
 		if err := json.Unmarshal([]byte(genericEvent.Body), &req); err != nil {
@@ -286,6 +247,101 @@ func HandleRequest(ctx context.Context, event json.RawMessage) (LambdaResponse, 
 		Message:      "Success",
 		FormattedMsg: formattedMsg,
 	}), nil
+}
+
+// tryParseVAPI attempts to detect and parse a VAPI tool-calls payload.
+// It uses a permissive two-stage parse: first detect the message type with
+// a minimal struct, then extract toolCalls and artifact with flexible types.
+func tryParseVAPI(ctx context.Context, requestID string, bodyToParse []byte, openaiKey string, req *models.Request, extractedPropertyID *string) bool {
+	// Stage 1: Quick detect — only check message.type
+	var detect struct {
+		Message struct {
+			Type string `json:"type"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(bodyToParse, &detect); err != nil || detect.Message.Type != "tool-calls" {
+		return false
+	}
+
+	slog.InfoContext(ctx, "event_type_detected", "request_id", requestID, "type", "vapi_tool_calls")
+
+	// Stage 2: Extract toolCalls with flexible argument parsing
+	var payload struct {
+		Message struct {
+			ToolCalls []struct {
+				ID       string `json:"id"`
+				Function struct {
+					Name      string          `json:"name"`
+					Arguments json.RawMessage `json:"arguments"`
+				} `json:"function"`
+			} `json:"toolCalls"`
+			Artifact models.VAPIArtifact `json:"artifact"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(bodyToParse, &payload); err != nil {
+		slog.ErrorContext(ctx, "vapi_payload_parse_failed", "request_id", requestID, "error", err)
+		return false
+	}
+
+	// Extract Query and Phone from first toolCall arguments
+	if len(payload.Message.ToolCalls) > 0 {
+		rawArgs := payload.Message.ToolCalls[0].Function.Arguments
+
+		// Try parsing as our known args struct
+		var args models.VAPIFunctionArgs
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			// Fallback: try to extract Query/Phone from a generic map
+			slog.WarnContext(ctx, "vapi_args_struct_parse_failed", "request_id", requestID, "error", err)
+			var argsMap map[string]interface{}
+			if err2 := json.Unmarshal(rawArgs, &argsMap); err2 == nil {
+				if q, ok := argsMap["Query"]; ok {
+					req.Query = fmt.Sprintf("%v", q)
+				}
+				if p, ok := argsMap["Phone"]; ok {
+					req.Phone = fmt.Sprintf("%v", p)
+				}
+			}
+		} else {
+			req.Query = args.Query
+			req.Phone = args.Phone
+		}
+		slog.InfoContext(ctx, "vapi_params_extracted", "request_id", requestID, "query", req.Query, "phone", req.Phone)
+	}
+
+	// Collect address candidates from tool_call_result messages
+	var candidates []clients.AddressCandidate
+	for _, msg := range payload.Message.Artifact.Messages {
+		if msg.Role == "tool_call_result" {
+			parsed := msg.ParseResult()
+			if parsed == nil {
+				continue
+			}
+			for i, result := range parsed.Results {
+				if result.Metadata.Address1 != "" && result.Metadata.PropertyId != "" {
+					candidates = append(candidates, clients.AddressCandidate{
+						Index:      i,
+						Address1:   result.Metadata.Address1,
+						PropertyId: result.Metadata.PropertyId,
+					})
+				}
+			}
+		}
+	}
+
+	// Use OpenAI to match query to address if candidates exist
+	if len(candidates) > 0 && openaiKey != "" && req.Query != "" {
+		slog.InfoContext(ctx, "openai_matching_started", "request_id", requestID, "candidate_count", len(candidates))
+		openaiClient := clients.NewOpenAIClient(openaiKey)
+		matchedID, err := openaiClient.MatchAddressToQuery(ctx, req.Query, candidates)
+		if err != nil {
+			slog.WarnContext(ctx, "openai_matching_failed", "request_id", requestID, "error", err)
+		} else {
+			*extractedPropertyID = matchedID
+			slog.InfoContext(ctx, "openai_matching_succeeded", "request_id", requestID, "property_id", *extractedPropertyID)
+		}
+	}
+
+	return true
 }
 
 func mapPropertyInfo(p *models.AppFolioProperty) models.PropertyInfo {
