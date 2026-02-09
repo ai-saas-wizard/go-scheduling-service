@@ -1,0 +1,16 @@
+# Build artifacts
+bootstrap
+bootstrap-local
+scheduling-deployment.zip
+
+# Test payloads
+ToolCallPayload.json
+
+# OS
+.DS_Store
+
+# IDE
+.claude/
+.cursor/
+.vscode/
+.idea/

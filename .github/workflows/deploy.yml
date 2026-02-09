@@ -1,0 +1,60 @@
+name: Build and Deploy to AWS Lambda
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  LAMBDA_FUNCTION_NAME: go-scheduling-service-v2
+  AWS_REGION: us-west-2
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build Lambda binary
+        run: |
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags lambda.norpc -o bootstrap cmd/main.go
+          zip scheduling-deployment.zip bootstrap
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to Lambda
+        run: |
+          # Check if function exists
+          if aws lambda get-function --function-name $LAMBDA_FUNCTION_NAME 2>/dev/null; then
+            echo "Updating existing Lambda function..."
+            aws lambda update-function-code \
+              --function-name $LAMBDA_FUNCTION_NAME \
+              --zip-file fileb://scheduling-deployment.zip
+          else
+            echo "Creating new Lambda function..."
+            aws lambda create-function \
+              --function-name $LAMBDA_FUNCTION_NAME \
+              --runtime provided.al2023 \
+              --handler bootstrap \
+              --architectures x86_64 \
+              --role ${{ secrets.LAMBDA_EXECUTION_ROLE_ARN }} \
+              --zip-file fileb://scheduling-deployment.zip \
+              --timeout 60 \
+              --memory-size 256 \
+              --tracing-config Mode=Active \
+              --environment "Variables={SUPABASE_PROJECT_ID=placeholder,SUPABASE_KEY=placeholder,APPFOLIO_AUTH_HEADER=placeholder,APPFOLIO_DEVELOPER_ID=placeholder,SEARCH_SERVICE_URL=placeholder,OPENAI_API_KEY=placeholder}"
+          fi
