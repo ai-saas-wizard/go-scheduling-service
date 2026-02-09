@@ -1,6 +1,9 @@
 package models
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Request is the input event for the Lambda
 type Request struct {
@@ -138,9 +141,26 @@ type VAPIArtifact struct {
 }
 
 type VAPIArtifactMessage struct {
-	Role   string              `json:"role"`
-	Name   string              `json:"name,omitempty"`
-	Result *VAPIToolCallResult `json:"result,omitempty"`
+	Role      string          `json:"role"`
+	Name      string          `json:"name,omitempty"`
+	RawResult json.RawMessage `json:"result,omitempty"`
+}
+
+// ParseResult attempts to parse the result as a VAPIToolCallResult.
+// Returns nil if the result is a string or cannot be parsed.
+func (m *VAPIArtifactMessage) ParseResult() *VAPIToolCallResult {
+	if len(m.RawResult) == 0 {
+		return nil
+	}
+	// Skip if the result is a JSON string (starts with '"')
+	if m.RawResult[0] == '"' {
+		return nil
+	}
+	var result VAPIToolCallResult
+	if err := json.Unmarshal(m.RawResult, &result); err != nil {
+		return nil
+	}
+	return &result
 }
 
 type VAPIToolCallResult struct {

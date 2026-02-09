@@ -115,8 +115,12 @@ func HandleRequest(ctx context.Context, event json.RawMessage) (LambdaResponse, 
 		// Collect address candidates from tool_call_result messages
 		var candidates []clients.AddressCandidate
 		for _, msg := range vapiPayload.Message.Artifact.Messages {
-			if msg.Role == "tool_call_result" && msg.Result != nil {
-				for i, result := range msg.Result.Results {
+			if msg.Role == "tool_call_result" {
+				parsed := msg.ParseResult()
+				if parsed == nil {
+					continue
+				}
+				for i, result := range parsed.Results {
 					if result.Metadata.Address1 != "" && result.Metadata.PropertyId != "" {
 						candidates = append(candidates, clients.AddressCandidate{
 							Index:      i,
