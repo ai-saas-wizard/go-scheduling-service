@@ -18,17 +18,6 @@ import (
 	"github.com/vishnuanilkumar/go-scheduling-service/internal/models"
 )
 
-// GenericEvent handles multiple event formats (API Gateway, Function URL, direct invoke)
-type GenericEvent struct {
-	// Direct invocation fields
-	Query string `json:"Query"`
-	Phone string `json:"Phone"`
-
-	// API Gateway / Function URL fields
-	Body            string `json:"body"`
-	IsBase64Encoded bool   `json:"isBase64Encoded"`
-}
-
 // LambdaResponse wraps the output for API Gateway compatibility
 type LambdaResponse struct {
 	StatusCode int               `json:"statusCode"`
@@ -85,42 +74,33 @@ func HandleRequest(ctx context.Context, event json.RawMessage) (LambdaResponse, 
 		return errorResponse(500, "Missing configuration"), nil
 	}
 
-	// 2. Parse Event - handle VAPI tool-calls or regular formats
+	// 2. Parse Event - handle multiple formats:
+	//    a) VAPI tool-calls (direct or wrapped in body)
+	//    b) n8n webhook envelope: {"headers":{}, "body":{VAPI payload}, "query":{}, ...}
+	//    c) API Gateway 1.0: {"body": "{stringified JSON}", ...}
+	//    d) Direct invoke: {"Query": "...", "Phone": "..."}
 	var req models.Request
 	var extractedPropertyID string
 
-	var genericEvent GenericEvent
-	if err := json.Unmarshal(event, &genericEvent); err != nil {
-		slog.ErrorContext(ctx, "event_parse_failed", "request_id", requestID, "error", err)
-		return errorResponse(400, "Invalid event format"), nil
-	}
+	// Extract the body to parse — could be the event itself, or nested in a "body" field
+	bodyToParse := extractBody(event)
 
-	bodyToParse := event
-	if genericEvent.Body != "" {
-		bodyToParse = []byte(genericEvent.Body)
-	}
-
-	// Try to detect VAPI tool-calls payload from bodyToParse
+	// Try VAPI detection first (works for all envelope formats)
 	vapiParsed := tryParseVAPI(ctx, requestID, bodyToParse, openaiKey, &req, &extractedPropertyID)
 
 	if vapiParsed {
 		// VAPI payload handled
-	} else if genericEvent.Body != "" {
-		slog.InfoContext(ctx, "event_type_detected", "request_id", requestID, "type", "api_gateway")
-		if err := json.Unmarshal([]byte(genericEvent.Body), &req); err != nil {
-			slog.ErrorContext(ctx, "body_parse_failed", "request_id", requestID, "error", err)
-			return errorResponse(400, "Invalid JSON in body"), nil
-		}
-	} else if genericEvent.Query != "" {
-		slog.InfoContext(ctx, "event_type_detected", "request_id", requestID, "type", "direct_invocation")
-		req.Query = genericEvent.Query
-		req.Phone = genericEvent.Phone
 	} else {
-		slog.InfoContext(ctx, "event_type_detected", "request_id", requestID, "type", "raw_request")
-		if err := json.Unmarshal(event, &req); err != nil {
-			slog.ErrorContext(ctx, "request_parse_failed", "request_id", requestID, "error", err)
-			return errorResponse(400, "Invalid request format"), nil
+		// Try parsing as a simple Request (direct invoke or simple JSON)
+		if err := json.Unmarshal(bodyToParse, &req); err != nil {
+			// Last resort: try parsing the raw event
+			if err2 := json.Unmarshal(event, &req); err2 != nil {
+				slog.ErrorContext(ctx, "event_parse_failed", "request_id", requestID,
+					"body_error", err, "event_error", err2)
+				return errorResponse(400, "Invalid request format"), nil
+			}
 		}
+		slog.InfoContext(ctx, "event_type_detected", "request_id", requestID, "type", "simple_request")
 	}
 
 	slog.InfoContext(ctx, "request_parsed", "request_id", requestID, "query", req.Query)
@@ -247,6 +227,35 @@ func HandleRequest(ctx context.Context, event json.RawMessage) (LambdaResponse, 
 		Message:      "Success",
 		FormattedMsg: formattedMsg,
 	}), nil
+}
+
+// extractBody pulls the inner body from various event envelope formats.
+// It handles:
+//   - n8n webhook: {"body": {object}} → returns the object bytes
+//   - API Gateway 1.0: {"body": "stringified JSON"} → returns the parsed string bytes
+//   - Direct/raw: no body field → returns the event as-is
+func extractBody(event json.RawMessage) json.RawMessage {
+	var envelope struct {
+		Body json.RawMessage `json:"body,omitempty"`
+	}
+	if err := json.Unmarshal(event, &envelope); err != nil || len(envelope.Body) == 0 {
+		return event
+	}
+
+	// Check if body is a JSON string (API Gateway 1.0 wraps body as a string)
+	if envelope.Body[0] == '"' {
+		var bodyStr string
+		if err := json.Unmarshal(envelope.Body, &bodyStr); err == nil && len(bodyStr) > 0 {
+			return json.RawMessage(bodyStr)
+		}
+	}
+
+	// Body is a JSON object (n8n webhook or API Gateway 2.0)
+	if envelope.Body[0] == '{' || envelope.Body[0] == '[' {
+		return envelope.Body
+	}
+
+	return event
 }
 
 // tryParseVAPI attempts to detect and parse a VAPI tool-calls payload.
