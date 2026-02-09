@@ -85,6 +85,17 @@ func HandleRequest(ctx context.Context, event json.RawMessage) (LambdaResponse, 
 	// Extract the body to parse — could be the event itself, or nested in a "body" field
 	bodyToParse := extractBody(event)
 
+	// Log a preview of the extracted body for debugging
+	preview := string(bodyToParse)
+	if len(preview) > 200 {
+		preview = preview[:200]
+	}
+	slog.InfoContext(ctx, "body_extracted",
+		"request_id", requestID,
+		"body_size", len(bodyToParse),
+		"body_preview", preview,
+	)
+
 	// Try VAPI detection first (works for all envelope formats)
 	vapiParsed := tryParseVAPI(ctx, requestID, bodyToParse, openaiKey, &req, &extractedPropertyID)
 
@@ -230,11 +241,21 @@ func HandleRequest(ctx context.Context, event json.RawMessage) (LambdaResponse, 
 }
 
 // extractBody pulls the inner body from various event envelope formats.
-// It handles:
+// It recursively unwraps nested "body" fields to handle cases like:
+//   - API Gateway 1.0 → n8n envelope → VAPI payload (double-nested body)
 //   - n8n webhook: {"body": {object}} → returns the object bytes
 //   - API Gateway 1.0: {"body": "stringified JSON"} → returns the parsed string bytes
 //   - Direct/raw: no body field → returns the event as-is
 func extractBody(event json.RawMessage) json.RawMessage {
+	return extractBodyRecursive(event, 0)
+}
+
+func extractBodyRecursive(event json.RawMessage, depth int) json.RawMessage {
+	// Safety: prevent infinite recursion (max 3 levels deep should be plenty)
+	if depth > 3 {
+		return event
+	}
+
 	var envelope struct {
 		Body json.RawMessage `json:"body,omitempty"`
 	}
@@ -242,20 +263,28 @@ func extractBody(event json.RawMessage) json.RawMessage {
 		return event
 	}
 
+	var extracted json.RawMessage
+
 	// Check if body is a JSON string (API Gateway 1.0 wraps body as a string)
 	if envelope.Body[0] == '"' {
 		var bodyStr string
 		if err := json.Unmarshal(envelope.Body, &bodyStr); err == nil && len(bodyStr) > 0 {
-			return json.RawMessage(bodyStr)
+			extracted = json.RawMessage(bodyStr)
 		}
 	}
 
 	// Body is a JSON object (n8n webhook or API Gateway 2.0)
-	if envelope.Body[0] == '{' || envelope.Body[0] == '[' {
-		return envelope.Body
+	if extracted == nil && (envelope.Body[0] == '{' || envelope.Body[0] == '[') {
+		extracted = envelope.Body
 	}
 
-	return event
+	if extracted == nil {
+		return event
+	}
+
+	// Recursively check if the extracted body itself has a nested "body" field
+	// This handles: API Gateway body (string) → n8n envelope (with body) → VAPI payload
+	return extractBodyRecursive(extracted, depth+1)
 }
 
 // tryParseVAPI attempts to detect and parse a VAPI tool-calls payload.
